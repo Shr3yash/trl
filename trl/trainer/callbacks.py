@@ -671,6 +671,7 @@ class BEMACallback(TrainerCallback):
         self.thetat_params = []  # references to training model params
         self.theta0_params = []  # θ₀ buffers (on self.device)
         self.ema_params = []  # EMA buffers (on self.device)
+        self.running_params = []  # trainable params of the running model, aligned with param_names
         self.running_model = None  # a copy of the model to run BEMA on
 
     @staticmethod
@@ -717,6 +718,9 @@ class BEMACallback(TrainerCallback):
             self.theta0_params.append(theta0)
             self.ema_params.append(theta0.clone())  # initialize EMA with θ₀
 
+        # running_model.parameters() also includes frozen weights, so match by name
+        self.running_params = [self.running_model.get_parameter(name) for name in self.param_names]
+
     def _ema_beta(self, step: int) -> float:
         """Compute the EMA decay factor βₜ = (ρ + γ·t)⁻ᵏᵃᵖᵖᵃ."""
         beta = (self.lag + self.multiplier * step) ** (-self.ema_power)
@@ -732,7 +736,7 @@ class BEMACallback(TrainerCallback):
 
         # Compute EMA + BEMA in-place and write directly to running_model
         for thetat, theta0, ema, run_param in zip(
-            self.thetat_params, self.theta0_params, self.ema_params, self.running_model.parameters(), strict=True
+            self.thetat_params, self.theta0_params, self.ema_params, self.running_params, strict=True
         ):
             thetat = thetat.detach().to(self.device)
             ema.mul_(1 - beta).add_(thetat, alpha=beta)  # EMA update: ema = (1 - beta) * ema + beta * θₜ

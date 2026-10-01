@@ -16,8 +16,16 @@ import json
 import os
 from unittest.mock import call, patch
 
+import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, Trainer, TrainingArguments
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
 
 from trl import BEMACallback, LogCompletionsCallback
 
@@ -238,3 +246,73 @@ class TestBEMACallback(TrlTestCase):
             callbacks=[bema_callback],
         )
         trainer.train()
+
+    def test_frozen_parameters(self):
+        """Test that BEMA updates trainable weights and leaves frozen weights unchanged."""
+        self.model.model.embed_tokens.weight.requires_grad_(False)
+        training_args = TrainingArguments(
+            output_dir=self.tmp_dir,
+            max_steps=4,
+            per_device_train_batch_size=2,
+            report_to="none",
+        )
+        bema_callback = BEMACallback(update_freq=1)
+
+        class SnapshotCallback(TrainerCallback):
+            def __init__(self):
+                self.theta0 = None
+                self.steps = {}
+
+            def on_step_end(self, args, state, control, **kwargs):
+                # Captured before BEMA's own on_step_end, so these are the weights that update reads.
+                if self.theta0 is None:
+                    self.theta0 = [param.detach().to("cpu").clone() for param in bema_callback.theta0_params]
+                self.steps[state.global_step] = [
+                    param.detach().to("cpu").clone() for param in bema_callback.thetat_params
+                ]
+
+        snapshot = SnapshotCallback()
+        trainer = Trainer(
+            model=self.model,
+            args=training_args,
+            train_dataset=self.dataset["train"],
+            processing_class=self.tokenizer,
+            callbacks=[snapshot, bema_callback],
+        )
+        trainer.train()
+
+        assert len(bema_callback.running_params) == len(bema_callback.param_names)
+        assert len(bema_callback.running_params) < len(list(bema_callback.running_model.parameters()))
+        assert "model.embed_tokens.weight" not in bema_callback.param_names
+
+        # Replay θₜ' = αₜ·(θₜ − θ₀) + EMAₜ independently of the callback's update loop.
+        theta0 = snapshot.theta0
+        ema = [param.clone() for param in theta0]
+        expected = None
+        for step in range(1, training_args.max_steps + 1):
+            if step < bema_callback.update_after:
+                continue
+            if step == bema_callback.update_after:
+                for theta0_param, ema_param, thetat in zip(theta0, ema, snapshot.steps[step], strict=True):
+                    theta0_param.copy_(thetat)
+                    ema_param.copy_(thetat)
+            elif (step - bema_callback.update_after) % bema_callback.update_freq == 0:
+                beta = (bema_callback.lag + bema_callback.multiplier * step) ** (-bema_callback.ema_power)
+                beta = max(beta, bema_callback.min_ema_multiplier)
+                alpha = (bema_callback.lag + bema_callback.multiplier * step) ** (-bema_callback.bias_power)
+                expected = []
+                for ema_param, theta0_param, thetat in zip(ema, theta0, snapshot.steps[step], strict=True):
+                    ema_param.mul_(1 - beta).add_(thetat, alpha=beta)
+                    expected.append(ema_param + alpha * (thetat - theta0_param))
+
+        assert expected is not None
+        # The shadow model is built in its default dtype, so compare values after that cast.
+        for expected_param, run_param in zip(expected, bema_callback.running_params, strict=True):
+            actual = run_param.detach().to(device="cpu", dtype=torch.float32)
+            torch.testing.assert_close(actual, expected_param.to(dtype=torch.float32))
+
+        live_embed = self.model.model.embed_tokens.weight.detach().to(device="cpu", dtype=torch.float32)
+        bema_embed = bema_callback.running_model.model.embed_tokens.weight.detach().to(
+            device="cpu", dtype=torch.float32
+        )
+        torch.testing.assert_close(bema_embed, live_embed)

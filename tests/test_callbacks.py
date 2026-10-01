@@ -306,9 +306,13 @@ class TestBEMACallback(TrlTestCase):
                     expected.append(ema_param + alpha * (thetat - theta0_param))
 
         assert expected is not None
+        # The shadow model is built in its default dtype, so compare values after that cast.
         for expected_param, run_param in zip(expected, bema_callback.running_params, strict=True):
-            torch.testing.assert_close(run_param.detach().to("cpu"), expected_param)
+            actual = run_param.detach().to(device="cpu", dtype=torch.float32)
+            torch.testing.assert_close(actual, expected_param.to(dtype=torch.float32))
 
-        live_embed = self.model.model.embed_tokens.weight.detach().to("cpu")
-        bema_embed = bema_callback.running_model.model.embed_tokens.weight.detach().to("cpu")
+        live_embed = self.model.model.embed_tokens.weight.detach().to(device="cpu", dtype=torch.float32)
+        bema_embed = bema_callback.running_model.model.embed_tokens.weight.detach().to(
+            device="cpu", dtype=torch.float32
+        )
         torch.testing.assert_close(bema_embed, live_embed)
